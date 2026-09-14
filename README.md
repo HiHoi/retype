@@ -41,12 +41,18 @@ retype 익스텐션 = MCP 서버 + 커맨드
 **다음 스텝** — 별도 툴이 없다. `propose`가 돌아온다는 것 자체가 한 덩어리가 끝났다는
 신호라, 에이전트가 그 자리에서 다음을 제안한다.
 
+`propose_change`는 기존 코드를 고칠 때 쓴다. 지정한 줄 범위를 선택해 두고, 사람이
+Backspace/Delete로 지우거나 선택된 상태에서 새 코드를 직접 입력해야 확정된다. 제안 뒤에는
+에이전트가 `read_diagnostics()`로 현재 오류와 경고를 확인할 수 있다.
+
 ## MCP 툴
 
 | 툴 | 하는 일 |
 |---|---|
 | `propose(text, why, file?, line?)` | 회색 제안을 띄우고 사람이 다 칠 때까지 블로킹. `{typed, ms, mistakes}` 또는 `{typed:false, reason}` (`cancelled`·`abandoned`·`timeout`·이미 있으면 `already_present`). 들여쓰기는 파일 설정(탭/스페이스)으로 맞춰준다 |
+| `propose_change(text, why, oldText, startLine, endLine, file?)` | 기존 줄 범위를 자동 수정하지 않고 선택한다. 사람이 직접 지우거나 새 텍스트로 교체해야 끝난다. 현재 코드가 `oldText`와 다르면 `stale`로 끝난다 |
 | `read_viewport()` | 지금 보이는 파일·줄범위·본문·선택영역 |
+| `read_diagnostics(file?)` | 현재 또는 지정 파일의 VS Code 오류·경고·정보·힌트와 위치 |
 
 ## 설치
 

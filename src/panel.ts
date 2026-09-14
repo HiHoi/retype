@@ -6,7 +6,9 @@ import * as fs from 'node:fs';
 
 const RULES =
   '코드를 쓸 때는 Edit/Write 대신 retype의 propose(text, why)로 제안한다. 한 번에 한 덩어리(길어야 십여 줄). ' +
-  'propose가 돌아오면 그 자리에서 다음 덩어리를 제안한다. "여기"·"이 부분"은 read_viewport()로 읽는다.';
+  '기존 코드를 고칠 때는 retype의 propose_change(oldText, text, why)로 제안한다. ' +
+  'propose가 typed:true로 돌아오면 read_diagnostics(file?)로 오류와 경고를 확인한 뒤, ' +
+  '그 결과를 설명하고 다음 작은 덩어리를 제안한다. "여기"·"이 부분"은 read_viewport()로 읽는다.';
 
 const controller = vscode.comments.createCommentController('retype', 'retype');
 controller.commentingRangeProvider = {
@@ -148,8 +150,10 @@ async function submit(reply: vscode.CommentReply) {
     text: say,
     tool: (name, input) =>
       say(
-        name === 'propose'
+        name === 'propose' || name === 'propose_change'
           ? `$(edit) **따라쓰기** — ${input.why ?? ''}`
+          : name === 'read_diagnostics'
+            ? '$(check) 진단을 확인함'
           : `$(eye) 화면을 읽음`
       ),
     session: (id) => (meta.session = id),
@@ -211,7 +215,7 @@ const claude: Agent = {
     JSON.stringify({ mcpServers: { retype: { type: 'http', url: mcpUrl() } } }),
     '--strict-mcp-config',
     '--allowedTools',
-    'mcp__retype__propose,mcp__retype__read_viewport',
+    'mcp__retype__propose,mcp__retype__propose_change,mcp__retype__read_viewport,mcp__retype__read_diagnostics',
     ...(resume ? ['--resume', resume] : []),
   ],
   // stream-json 한 줄. assistant 텍스트만 건진다. 코드는 propose로 이미 고스트에 떴다.
