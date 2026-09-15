@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
-import { propose } from './ghost';
+import { propose, proposeChange } from './ghost';
 
 function timeoutMs() {
   const min = vscode.workspace.getConfiguration('retype').get<number>('timeoutMinutes', 10);
@@ -27,18 +27,22 @@ function currentEditor(): vscode.TextEditor | undefined {
   );
 }
 
+function uriFor(file: string): vscode.Uri {
+  return file.startsWith('/')
+    ? vscode.Uri.file(file)
+    : vscode.Uri.joinPath(
+        vscode.workspace.workspaceFolders?.[0]?.uri ?? vscode.Uri.file(process.cwd()),
+        file
+      );
+}
+
 async function editorFor(file?: string): Promise<vscode.TextEditor> {
   if (!file) {
     const editor = currentEditor();
     if (!editor) throw new Error('열려 있는 편집기가 없다. file을 넘기거나 파일을 열어라.');
     return editor;
   }
-  const uri = file.startsWith('/')
-    ? vscode.Uri.file(file)
-    : vscode.Uri.joinPath(
-        vscode.workspace.workspaceFolders?.[0]?.uri ?? vscode.Uri.file(process.cwd()),
-        file
-      );
+  const uri = uriFor(file);
   const doc = await vscode.workspace.openTextDocument(uri);
   return vscode.window.showTextDocument(doc, { preview: false });
 }
@@ -58,6 +62,60 @@ export function normalizeIndent(text: string, opts: vscode.TextEditorOptions): s
       return indent + line.slice(m.length);
     })
     .join('\n');
+}
+
+function lineRange(editor: vscode.TextEditor, startLine: number, endLine: number): vscode.Range {
+  if (startLine < 1 || endLine < startLine || startLine > editor.document.lineCount) {
+    throw new Error('startLine/endLine 범위가 올바르지 않다.');
+  }
+  const start = Math.min(startLine - 1, editor.document.lineCount - 1);
+  const end = Math.min(endLine - 1, editor.document.lineCount - 1);
+  return new vscode.Range(
+    new vscode.Position(start, 0),
+    new vscode.Position(end, editor.document.lineAt(end).text.length)
+  );
+}
+
+function severityName(severity: vscode.DiagnosticSeverity) {
+  switch (severity) {
+    case vscode.DiagnosticSeverity.Error:
+      return 'error';
+    case vscode.DiagnosticSeverity.Warning:
+      return 'warning';
+    case vscode.DiagnosticSeverity.Information:
+      return 'info';
+    default:
+      return 'hint';
+  }
+}
+
+function diagnosticCode(code: vscode.Diagnostic['code']) {
+  if (code === undefined) return null;
+  return typeof code === 'object' ? code.value : code;
+}
+
+function serializeDiagnostics(uri: vscode.Uri) {
+  const diagnostics = vscode.languages.getDiagnostics(uri);
+  const counts = { error: 0, warning: 0, info: 0, hint: 0 };
+  const items = diagnostics.map((d) => {
+    const severity = severityName(d.severity);
+    counts[severity]++;
+    return {
+      message: d.message,
+      severity,
+      source: d.source ?? null,
+      code: diagnosticCode(d.code),
+      startLine: d.range.start.line + 1,
+      startCharacter: d.range.start.character,
+      endLine: d.range.end.line + 1,
+      endCharacter: d.range.end.character,
+    };
+  });
+  return {
+    file: vscode.workspace.asRelativePath(uri),
+    diagnostics: items,
+    counts,
+  };
 }
 
 function buildServer(): McpServer {
@@ -118,6 +176,54 @@ function buildServer(): McpServer {
   );
 
   server.registerTool(
+    'propose_change',
+    {
+      title: '변경 따라쓰기 제안',
+      description:
+        '기존 코드 범위를 자동으로 고치지 말고, 선택된 영역을 사람이 직접 지우거나 새 텍스트로 교체하게 해라. ' +
+        'oldText가 현재 문서와 다르면 stale로 끝난다. startLine/endLine은 1-based inclusive다. ' +
+        '사람이 변경을 끝낼 때까지 이 호출은 돌아오지 않는다.',
+      inputSchema: {
+        text: z.string().describe('사람이 직접 입력할 새 텍스트. 들여쓰기는 파일 기준 절대값.'),
+        why: z.string().describe('왜 이 범위를 이렇게 바꾸는지 한 줄.'),
+        oldText: z.string().describe('교체할 현재 코드. 문서와 정확히 같아야 한다.'),
+        startLine: z.number().int().min(1).describe('교체 범위 시작 줄. 1-based inclusive.'),
+        endLine: z.number().int().min(1).describe('교체 범위 끝 줄. 1-based inclusive.'),
+        file: z.string().optional().describe('대상 파일. 생략하면 마지막 활성 편집기.'),
+      },
+    },
+    async ({ text, why, oldText, startLine, endLine, file }) => {
+      const editor = await editorFor(file);
+      let range: vscode.Range;
+      try {
+        range = lineRange(editor, startLine, endLine);
+      } catch (err) {
+        return {
+          content: [{ type: 'text', text: String(err) }],
+          isError: true,
+        };
+      }
+
+      if (editor.document.getText(range) !== oldText) {
+        const result = { typed: false, reason: 'stale' };
+        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+      }
+      if (oldText === text) {
+        const result = { typed: false, reason: 'already_present' };
+        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+      }
+
+      text = normalizeIndent(text, editor.options);
+      editor.selection = new vscode.Selection(range.start, range.end);
+      editor.revealRange(range);
+      const anchor = editor.document.offsetAt(range.start);
+      const oldEnd = editor.document.offsetAt(range.end);
+      const result = await proposeChange(editor, anchor, oldEnd, text, why, timeoutMs());
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    }
+  );
+
+  server.registerTool(
     'read_viewport',
     {
       title: '지금 보이는 구간',
@@ -144,6 +250,40 @@ function buildServer(): McpServer {
         text: editor.document.getText(range),
       };
       return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    'read_diagnostics',
+    {
+      title: '현재 진단 읽기',
+      description:
+        '현재 또는 지정한 파일의 VS Code diagnostics를 읽는다. ' +
+        'propose가 typed:true로 돌아온 뒤 오류와 경고를 확인할 때 사용해라.',
+      inputSchema: {
+        file: z.string().optional().describe('대상 파일. 생략하면 마지막 활성 편집기.'),
+      },
+    },
+    async ({ file }) => {
+      const editor = file ? undefined : currentEditor();
+      const uri = file ? uriFor(file) : editor?.document.uri;
+      if (!uri) {
+        return {
+          content: [{ type: 'text', text: '열려 있는 편집기가 없다. file을 넘겨라.' }],
+          isError: true,
+        };
+      }
+      if (file) {
+        try {
+          await vscode.workspace.openTextDocument(uri);
+        } catch (err) {
+          return {
+            content: [{ type: 'text', text: `파일을 열 수 없다: ${String(err)}` }],
+            isError: true,
+          };
+        }
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(serializeDiagnostics(uri), null, 2) }] };
     }
   );
 

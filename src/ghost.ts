@@ -10,6 +10,19 @@ const mistakeDeco = vscode.window.createTextEditorDecorationType({
   backgroundColor: new vscode.ThemeColor('inputValidation.errorBackground'),
 });
 
+const changeDeco = vscode.window.createTextEditorDecorationType({
+  backgroundColor: new vscode.ThemeColor('editor.findMatchHighlightBackground'),
+  border: '1px solid var(--vscode-editorWarning-foreground)',
+  borderRadius: '2px',
+});
+
+type SessionKind = 'insert' | 'change';
+
+type SessionOptions = {
+  kind?: SessionKind;
+  oldEnd?: number;
+};
+
 /** 지금 진행 중인 따라쓰기. 한 번에 하나만 돈다. */
 let active: Session | null = null;
 
@@ -20,6 +33,7 @@ let active: Session | null = null;
 export const ghostProvider: vscode.InlineCompletionItemProvider = {
   provideInlineCompletionItems(document, position) {
     if (!active || active.doc.uri.toString() !== document.uri.toString()) return [];
+    if (active.kind === 'change' && !active.changeStarted) return [];
     const offset = document.offsetAt(position);
     // 커서가 친 범위 밖(앞쪽이나 기존 코드 위)이면 회색도 없다
     if (offset < active.anchor || offset > active.end) return [];
@@ -49,11 +63,14 @@ export const whyLensProvider: vscode.CodeLensProvider = {
 };
 
 class Session {
+  readonly kind: SessionKind;
   readonly doc: vscode.TextDocument;
   /** 고스트가 시작하는 오프셋. 앞쪽이 편집되면 따라 움직인다. */
   anchor: number;
   /** 세션 시작 후 실제로 끼워넣은 텍스트의 끝. anchor..end 만 판정 대상이고, 그 뒤 기존 코드는 안 본다. */
   end: number;
+  /** 교체 모드에서 기존 선택 영역의 끝. 첫 변경 뒤에는 사용하지 않는다. */
+  private oldEnd: number;
   readonly target: string;
   readonly why: string;
 
@@ -62,6 +79,7 @@ class Session {
   private readonly settle: (r: ProposeResult) => void;
   private timer: NodeJS.Timeout;
   private readonly timeoutMs: number;
+  changeStarted = false;
   private mistakes = 0;
   private wasMistaken = false;
   private done = false;
@@ -74,11 +92,14 @@ class Session {
     why: string,
     timeoutMs: number,
     startedAt: number,
-    settle: (r: ProposeResult) => void
+    settle: (r: ProposeResult) => void,
+    options: SessionOptions = {}
   ) {
+    this.kind = options.kind ?? 'insert';
     this.doc = editor.document;
     this.anchor = anchor;
-    this.end = anchor;
+    this.end = options.oldEnd ?? anchor;
+    this.oldEnd = options.oldEnd ?? anchor;
     this.target = target;
     this.why = why;
     this.timeoutMs = timeoutMs;
@@ -93,18 +114,35 @@ class Session {
     this.disposables.push(
       vscode.workspace.onDidChangeTextDocument((e) => {
         if (e.document.uri.toString() !== this.doc.uri.toString()) return;
-        // 앵커 앞이 바뀌면(윗줄 삭제 등) 앵커·끝이 같이 밀린다. 앵커를 걸쳐 지우면 그 자리로 당긴다.
-        // anchor..end 안의 편집은 끝을 늘리거나 줄인다. 끝 너머(기존 코드) 편집은 무시한다.
         for (const c of e.contentChanges) {
           const s = c.rangeOffset;
           const e2 = s + c.rangeLength;
           const delta = c.text.length - c.rangeLength;
+          let changeStartedHere = false;
+
+          // 교체 제안은 선택된 기존 범위가 처음 바뀌는 순간부터 새 텍스트를 판정한다.
+          // 선택 영역을 바로 타이핑해 교체하거나, 먼저 지운 뒤 입력하는 두 경로를 모두 허용한다.
+          if (this.kind === 'change' && !this.changeStarted) {
+            const touchesOldRange = s <= this.oldEnd && e2 >= this.anchor;
+            if (touchesOldRange) {
+              this.changeStarted = true;
+              this.end = this.oldEnd + delta;
+              changeStartedHere = true;
+            }
+          }
+
+          if (changeStartedHere) continue;
+
+          // 앵커 앞이 바뀌면(윗줄 삭제 등) 앵커·끝이 같이 밀린다. 앵커를 걸쳐 지우면 그 자리로 당긴다.
+          // anchor..end 안의 편집은 끝을 늘리거나 줄인다. 끝 너머(기존 코드) 편집은 무시한다.
           if (e2 < this.anchor || (e2 === this.anchor && c.rangeLength > 0)) {
             this.anchor += delta;
             this.end += delta;
+            this.oldEnd += delta;
           } else if (s < this.anchor) {
             this.anchor = s;
             this.end = s + c.text.length;
+            this.oldEnd = this.kind === 'change' && !this.changeStarted ? s + c.text.length : this.oldEnd;
           } else if (s <= this.end) {
             this.end = e2 <= this.end ? this.end + delta : s + c.text.length;
           }
@@ -147,6 +185,18 @@ class Session {
     if (this.done) return;
     const editor = this.editor();
     if (!editor) return;
+
+    if (this.kind === 'change' && !this.changeStarted) {
+      editor.setDecorations(changeDeco, [
+        new vscode.Range(editor.document.positionAt(this.anchor), editor.document.positionAt(this.oldEnd)),
+      ]);
+      editor.setDecorations(mistakeDeco, []);
+      this.status.text = '$(pencil) retype 기존 코드 지우기';
+      this.status.tooltip = this.why;
+      return;
+    }
+
+    editor.setDecorations(changeDeco, []);
 
     // 사람이 친 것 = 앵커부터 커서까지, 단 끼워넣은 범위(end)를 넘지 않는다.
     // 괄호 자동 닫힘은 end엔 들어가지만 커서 뒤라서 아직 친 걸로 안 친다.
@@ -236,6 +286,7 @@ class Session {
     this.disposables.forEach((d) => d.dispose());
     const editor = this.editor();
     editor?.setDecorations(mistakeDeco, []);
+    editor?.setDecorations(changeDeco, []);
     this.status.dispose();
     active = null;
     vscode.commands.executeCommand('editor.action.inlineSuggest.hide');
@@ -265,5 +316,24 @@ export function propose(
   const startedAt = Date.now();
   return new Promise((resolve) => {
     active = new Session(editor, anchor, target, why, timeoutMs, startedAt, resolve);
+  });
+}
+
+/** 기존 범위를 선택해 두고, 사람이 직접 지우거나 교체한 뒤 새 텍스트를 따라 쓰게 한다. */
+export function proposeChange(
+  editor: vscode.TextEditor,
+  anchor: number,
+  oldEnd: number,
+  target: string,
+  why: string,
+  timeoutMs: number
+): Promise<ProposeResult> {
+  active?.cancel();
+  const startedAt = Date.now();
+  return new Promise((resolve) => {
+    active = new Session(editor, anchor, target, why, timeoutMs, startedAt, resolve, {
+      kind: 'change',
+      oldEnd,
+    });
   });
 }

@@ -42,10 +42,75 @@ export async function run() {
     new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${api.port}/mcp`))
   );
 
-  // 툴 두 개가 보인다
+  // 따라쓰기·변경 제안·진단·뷰포트 툴이 보인다
   {
     const { tools } = await client.listTools();
-    assert.deepEqual(tools.map((t) => t.name).sort(), ['propose', 'read_viewport']);
+    assert.deepEqual(tools.map((t) => t.name).sort(), [
+      'propose',
+      'propose_change',
+      'read_diagnostics',
+      'read_viewport',
+    ]);
+  }
+
+  // propose_change: 선택된 기존 코드를 사람이 직접 새 코드로 교체하면 typed:true
+  {
+    const editor = await openDoc('const value = old;\nkeep();');
+    const pending = client.callTool({
+      name: 'propose_change',
+      arguments: {
+        startLine: 1,
+        endLine: 1,
+        oldText: 'const value = old;',
+        text: 'const value = new;',
+        why: '값의 기본값을 교체',
+      },
+    });
+    await until(() => api.hasActive());
+    await type('const value = new;');
+    const r = parse<{ typed: boolean }>(await pending);
+    assert.equal(r.typed, true);
+    assert.equal(editor.document.getText(), 'const value = new;\nkeep();');
+  }
+
+  // propose_change: 기존 코드를 먼저 지운 뒤 새 코드를 직접 입력해도 완료된다
+  {
+    const editor = await openDoc('const value = old;');
+    const pending = client.callTool({
+      name: 'propose_change',
+      arguments: {
+        startLine: 1,
+        endLine: 1,
+        oldText: 'const value = old;',
+        text: 'const value = new;',
+        why: '값을 직접 교체',
+      },
+    });
+    await until(() => api.hasActive());
+    await vscode.commands.executeCommand('deleteLeft');
+    await type('const value = new;');
+    const r = parse<{ typed: boolean }>(await pending);
+    assert.equal(r.typed, true);
+    assert.equal(editor.document.getText(), 'const value = new;');
+  }
+
+  // propose_change: 현재 코드가 oldText와 다르면 stale로 즉시 종료한다
+  {
+    await openDoc('const value = current;');
+    const r = parse<{ typed: boolean; reason: string }>(
+      await client.callTool({
+        name: 'propose_change',
+        arguments: {
+          startLine: 1,
+          endLine: 1,
+          oldText: 'const value = old;',
+          text: 'const value = new;',
+          why: 'stale 범위',
+        },
+      })
+    );
+    assert.deepEqual(r, { typed: false, reason: 'stale' });
+    assert.equal(api.hasActive(), false);
   }
 
   // read_viewport: 보이는 파일과 본문을 돌려준다
@@ -58,6 +123,53 @@ export async function run() {
     assert.equal(v.startLine, 1);
     assert.equal(v.text, 'one\ntwo\nthree');
     assert.equal(v.selection, 'two');
+  }
+
+  // read_diagnostics: 현재 편집기의 diagnostics와 severity별 개수를 돌려준다
+  {
+    const editor = await openDoc('const broken = true;');
+    const collection = vscode.languages.createDiagnosticCollection('retype-test');
+    collection.set(editor.document.uri, [
+      new vscode.Diagnostic(
+        new vscode.Range(0, 6, 0, 12),
+        '검사용 오류',
+        vscode.DiagnosticSeverity.Error
+      ),
+    ]);
+    const r = parse<{
+      diagnostics: {
+        message: string;
+        severity: string;
+        source: string | null;
+        code: string | number | null;
+        startLine: number;
+        startCharacter: number;
+        endLine: number;
+        endCharacter: number;
+      }[];
+      counts: { error: number };
+    }>(await client.callTool({ name: 'read_diagnostics', arguments: {} }));
+    assert.equal(r.counts.error, 1);
+    assert.deepEqual(r.diagnostics[0], {
+      message: '검사용 오류',
+      severity: 'error',
+      source: null,
+      code: null,
+      startLine: 1,
+      startCharacter: 6,
+      endLine: 1,
+      endCharacter: 12,
+    });
+    collection.dispose();
+  }
+
+  // read_diagnostics: 지정한 파일이 없으면 조용히 빈 결과를 만들지 않고 오류로 알린다
+  {
+    const result = await client.callTool({
+      name: 'read_diagnostics',
+      arguments: { file: 'missing-retype-diagnostics.ts' },
+    });
+    assert.equal(result.isError, true);
   }
 
   // propose: 틀렸다 고치고 다 치면 typed:true, mistakes:1
